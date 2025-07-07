@@ -1,0 +1,1182 @@
+---
+title: "ACDC Systematic Review"
+author:
+  - name: "Lolita Muller"
+    email: "m.lolita@cgiar.org"
+    orcid: "0009-0002-8345-7219"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r,message=FALSE,warning=FALSE,echo=FALSE}
+
+# List of required packages
+required_packages <- c("s3fs", "readxl", "readr", "data.table", "dplyr", "ggplot2",
+                       "sf", "rnaturalearth", "treemap", "treemapify", "cowplot",
+                       "tidyr", "UpSetR", "grid", "viridis", "tiff", "raster", "sp","DT")
+
+
+# Install any packages not already installed
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load all required packages
+lapply(required_packages, library, character.only = TRUE)
+
+library(readr)
+#dowload from S3 bucket
+# Set up connection to S3 bucket
+s3<-s3fs::S3FileSystem$new(anonymous = T)
+  era_s3<-"s3://digital-atlas/era"
+  
+  # List the files in the s3 bucket
+  files<-s3$dir_ls(file.path(era_s3,"data"))
+  # This is the most recent version of the datas3://digital-atlas/era/data/skinny_cow_2022-YYYY-MM-DD.RData (substitute most recent date into filepath)
+  files<-tail(grep(".RData",grep("industrious_elephant_2023",files,value=T),value=T),1)
+  
+  # Set a save location for the dataset (amend to something more suitable for your needs)
+  save_path<-file.path(getwd(),basename(files))
+  
+  if(!file.exists(save_path)){
+    s3$file_download(files,save_path,overwrite = T)
+  }
+  
+  ERA<- miceadds::load.Rdata2(file=basename(save_path),path=dirname(save_path))
+  
+  papers_by_project <- read_csv("papers_by_project.csv")
+  
+  papers_by_project<-papers_by_project%>%
+    filter(Project=="ACDC")
+  
+  # Define a vector of Latin American countries
+latin_america_countries <- c(
+  "Argentina", "Bolivia", "Brazil", "Chile", "Colombia", "Costa Rica", 
+  "Cuba", "Dominican Republic", "Ecuador", "El Salvador", "Guatemala", 
+  "Honduras", "Mexico", "Nicaragua", "Panama", "Paraguay", 
+  "Peru", "Uruguay", "Venezuela"
+)
+
+# Filter papers_by_project for the ACDC project and Latin American countries
+papers_by_project <- papers_by_project %>%
+  filter(Project == "ACDC" & Country %in% latin_america_countries)%>%
+  dplyr::select(B.Code,Country)
+
+
+```
+
+```{r}
+
+papers_by_project<-as.data.table(papers_by_project)
+
+filtered_Tables <- lapply(ERA, function(tbl) {
+  if ("B.Code" %in% colnames(tbl)) {
+    # Convert to data.table
+    tbl <- as.data.table(tbl)
+    
+    # Filter rows with matching `B.Code`
+    filtered_tbl <- tbl[papers_by_project, on = .(B.Code), nomatch = 0]
+    
+    # Add `Country` column from `papers_by_project`
+    if (!"Country" %in% colnames(filtered_tbl)) {
+      filtered_tbl <- merge(filtered_tbl, papers_by_project, by = "B.Code", all.x = FALSE)
+    }
+    
+    # Rearrange columns
+    col_order <- c("B.Code", "Country", setdiff(names(tbl), c("B.Code", "Country")))
+    filtered_tbl <- filtered_tbl[, ..col_order]
+    
+    return(filtered_tbl)
+  } else {
+    return(tbl)  # Return unchanged if `B.Code` is not present
+  }
+})
+
+
+
+# Display the number of unique publications and LTEs
+cat("Number of unique papers:", length(unique(filtered_Tables$Pub.Out$B.Code)), "\n")
+
+```
+
+## Geographic Distribution of LTEs
+
+```{r,warning=FALSE}
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(viridis)
+library(DT)
+
+# Latin American countries
+latin_america_countries <- c(
+  "Argentina", "Bolivia", "Brazil", "Chile", "Colombia", "Costa Rica",
+  "Cuba", "Dominican Republic", "Ecuador", "El Salvador", "Guatemala",
+  "Honduras", "Mexico", "Nicaragua", "Panama", "Paraguay",
+  "Peru", "Uruguay", "Venezuela"
+)
+
+# Extract and clean Site data from filtered_Tables
+site_data <- as.data.frame(filtered_Tables$Site.Out) %>%
+  dplyr::select(B.Code, Country, Latitude = Site.LatD, Longitude = Site.LonD) %>%
+  distinct() %>%
+  mutate(
+    Longitude = as.numeric(Longitude),
+    Latitude = as.numeric(Latitude)
+  ) %>%
+  filter(!is.na(Longitude) & !is.na(Latitude)) %>% # Remove rows with missing coordinates
+  filter(Country %in% latin_america_countries)    # Filter for Latin American countries
+
+# Count the number of LTEs per country
+lte_counts <- site_data %>%
+  group_by(Country) %>%
+  summarise(N = n())
+
+# Prepare the world map
+world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(continent %in% c("South America", "North America") & 
+           admin %in% latin_america_countries) %>%
+  mutate(admin = if_else(admin == "United Republic of Tanzania", "Tanzania", admin))
+
+# Ensure the CRS of `world` is consistent (EPSG:4326)
+world <- st_transform(world, crs = 4326)
+
+# Filter site data to exclude regions outside Latin America
+site_data_filtered <- site_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Join LTE counts with country geometries for mapping
+countries_studies <- world %>%
+  dplyr::select(admin, geometry) %>%
+  rename(Country = admin) %>%
+  left_join(lte_counts, by = "Country")
+
+# Plot the map with LTE counts per country
+plot2 <- ggplot() +
+  geom_sf(data = countries_studies, aes(fill = N), color = "white") +
+  geom_point(data = site_data_filtered, aes(x = Longitude, y = Latitude), 
+             shape = 21, color = "black", fill = "white", size = 2, alpha = 0.4) +
+  scale_fill_viridis_c(
+    option = "cividis",
+    direction = -1,
+    na.value = "gray92"  # Set color for NA values
+  ) +
+  labs(fill = "Number of Studies") +
+  theme_minimal() +
+  theme(
+    legend.key.size = unit(1, "lines"), 
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = c(0.1, 0.15)
+  ) +
+  coord_sf(xlim = c(-120, -30), ylim = c(-60, 30), expand = FALSE) # Focus on Latin America
+
+# Display the plot
+plot2
+
+# Display the summary table of LTE counts by country
+DT::datatable(
+  lte_counts,
+  options = list(
+    scrollY = "400px",  # Set vertical scroll height
+    pageLength = 20     # Initial number of rows displayed
+  )
+)
+
+# Optionally save the summary table as a CSV
+# write.csv(lte_counts, "summary_by_country.csv", row.names = FALSE)
+
+```
+
+## Types of Products Studied in LTEs
+
+```{r,warning=FALSE}
+
+library(tidyr)
+
+# Prepare the data from filtered_Tables$Prod.Out
+DATA_split_product <- filtered_Tables$Prod.Out %>%
+  dplyr::select( P.Product.Subtype, B.Code) %>%
+  distinct() %>%  # Remove duplicates
+  filter(P.Product.Subtype != "Energy Production", P.Product.Subtype != "Bovine", P.Product.Subtype != "Caprine") %>%
+  separate_rows(P.Product.Subtype, sep = "-") %>%  # Split multiple product subtypes if necessary
+  group_by(P.Product.Subtype, B.Code) %>%
+  summarize(N_Studies = n_distinct(B.Code)) %>%  # Count distinct studies per subtype and LTE.ID
+  group_by(P.Product.Subtype) %>%
+  summarize(N_Studies = sum(N_Studies), .groups = 'drop')%>%
+ mutate(P.Product.Subtype = case_when(
+    P.Product.Subtype %in% c("Bovine") ~ "Cattle",
+    P.Product.Subtype %in% c("Caprine") ~ "Shoats",
+    P.Product.Subtype %in% c("Fodders") ~ "Fodder crops",
+    P.Product.Subtype %in% c("Starchy Staples") ~ "Roots and Tubers",
+    TRUE ~ P.Product.Subtype)) # Sum up LTEs and studies per subtype
+
+# Calculating relative abundance of each Product and taking out Trees and Fallow products that don't have relevance here 
+
+DATA_product <- DATA_split_product %>%
+  rename(Category = P.Product.Subtype) %>%
+  mutate(Relative_Abundance = (N_Studies / sum(N_Studies))) %>%
+  filter(Category!="Fallow",
+         Category!="Tree")
+
+# Custom colors for the categories
+custom_colors <- c(
+  "Cover Crop" = "#1664AB",
+  "Fallow" = "#1664AB",
+  "Cash Crops" = "#78B5D8",
+  "Cereals" = "#ABCFE5",
+  "Fibre & Wood" = "#78B5D8",
+  "Fodder crops" = "#60A6D1",
+  "Fruits" = "#ABCFE5",
+  "Nuts" = "#78B5D8",
+  "Spices" = "#78B5D8",
+  "Legumes" = "#CFE1F2",
+  "Oilseeds and Oils" = "#78B5D8",
+  "Tree" = "#4A97C9",
+  "Roots and Tubers" = "#F7FBFF",
+  "Vegetables" = "#CFE1F2"
+)
+
+# Function to calculate luminance of a color
+calculate_luminance <- function(color) {
+  cols <- col2rgb(color) / 255
+  (0.299 * cols[1, ] + 0.587 * cols[2, ] + 0.114 * cols[3, ])
+}
+
+# Function to determine text color based on background luminance
+text_color <- function(bg_color) {
+  if (calculate_luminance(bg_color) < 0.5) "white" else "black"
+}
+
+# Add a column for text color based on category color
+DATA_product <- DATA_product %>%
+  mutate(text_color = sapply(Category, function(cat) text_color(custom_colors[cat])))
+
+# Create the treemap plot
+plot9 <- ggplot(DATA_product, aes(area = N_Studies, fill = Category, label = ifelse(Category == "Porcine", "", paste0(Category, "\n", "(", N_Studies, ")")))) +
+  geom_treemap() +
+  geom_treemap_text(aes(colour = text_color), place = "center", size = 10) +
+  scale_fill_manual(values = custom_colors, guide = FALSE) +  # Use custom colors
+  scale_color_identity() +  # Apply the custom text colors
+  theme(
+    text = element_text(family = "Arial", face = "italic", size = 8),
+    panel.background = element_rect(fill = "white")
+  )
+
+# Display the plot
+plot9
+
+
+```
+
+```{r,warning=FALSE,fig.width=15, fig.height=10}
+
+DATA_split_product <- filtered_Tables$Prod.Out %>%
+  dplyr::select( P.Product.Subtype, P.Product, B.Code) %>%
+  distinct() %>%
+  filter(P.Product.Subtype != "Energy Production", 
+         P.Product.Subtype != "Bovine", 
+         P.Product.Subtype != "Caprine") %>%
+  separate_rows(P.Product.Subtype, sep = "-") %>%
+  group_by(P.Product.Subtype, P.Product, B.Code) %>%
+  summarize(N_Studies = n_distinct(B.Code), .groups = 'drop') %>%
+  group_by(P.Product.Subtype, P.Product) %>%
+  summarize(N_Studies = sum(N_Studies), .groups = 'drop')
+
+calculate_luminance <- function(color) {
+  cols <- col2rgb(color) / 255
+  (0.299 * cols[1, ] + 0.587 * cols[2, ] + 0.114 * cols[3, ])
+}
+
+text_color <- function(bg_color) {
+  if (calculate_luminance(bg_color) < 0.5) "white" else "black"
+}
+
+# Step 3: Set up color palette and ensure it matches unique categories
+distinct_colors <- viridis_pal(option = "F", direction = -1)(length(unique(DATA_split_product$Category)))  # 14 colors in reverse viridis palette
+names(distinct_colors) <- unique(DATA_split_product$Category)
+
+DATA_product <- DATA_split_product %>%
+  rename(Category = P.Product.Subtype, Subcategory = P.Product) %>%
+  mutate(Relative_Abundance = (N_Studies / sum(N_Studies)),
+         text_color = sapply(Category, function(cat) text_color(distinct_colors[cat]))) %>%
+  filter(Category!="Fallow",
+         Category!="Tree") %>%
+mutate(Category = case_when(
+    Category %in% c("Bovine") ~ "Cattle",
+    Category %in% c("Caprine") ~ "Shoats",
+    Category %in% c("Starchy Staples") ~ "Roots and Tubers",
+    TRUE ~ Category
+  )) %>%
+  filter(Category!="Fallow",
+         Category!="Tree")
+
+category_sum <- filtered_Tables$Prod.Out %>%
+  dplyr::select(P.Product.Subtype, B.Code) %>%
+  distinct() %>%  # Remove duplicates
+  filter(P.Product.Subtype != "Energy Production", P.Product.Subtype != "Bovine", P.Product.Subtype != "Caprine") %>%
+  separate_rows(P.Product.Subtype, sep = "-") %>%  # Split multiple product subtypes if necessary
+  group_by(P.Product.Subtype, B.Code) %>%
+  summarize(N_Studies = n_distinct(B.Code)) %>%  # Count distinct studies per subtype and LTE.ID
+  group_by(P.Product.Subtype) %>%
+  summarize( N_Studies = sum(N_Studies), .groups = 'drop') %>%
+  mutate(P.Product.Subtype = case_when(
+    P.Product.Subtype %in% c("Bovine") ~ "Cattle",
+    P.Product.Subtype %in% c("Caprine") ~ "Shoats",
+    P.Product.Subtype %in% c("Starchy Staples") ~ "Roots and Tubers",
+    TRUE ~ P.Product.Subtype
+  )) %>%
+  rename(Category = P.Product.Subtype)  # Rename for joining
+
+# Merge category sums into DATA_product
+DATA_product <- DATA_product %>%
+  left_join(category_sum %>% group_by(Category) %>% summarize(category_sum = sum(N_Studies)), by = "Category") %>%
+  mutate(Category_Label = paste0(Category, " (", category_sum, ")"))
+
+# Step 3: Set up color palette and ensure it matches unique categories
+distinct_colors <- viridis_pal(option = "F", direction = -1)(length(unique(DATA_product$Category)))  # 14 colors in reverse viridis palette
+names(distinct_colors) <- unique(DATA_product$Category)
+
+# Step 4: Define luminance functions for text color
+calculate_luminance <- function(color) {
+  cols <- col2rgb(color) / 255
+  (0.299 * cols[1, ] + 0.587 * cols[2, ] + 0.114 * cols[3, ])
+}
+
+text_color <- function(bg_color) {
+  if (calculate_luminance(bg_color) < 0.5) "white" else "black"
+}
+
+# Step 5: Apply text color based on background color
+DATA_product <- DATA_product %>%
+  mutate(text_color = sapply(Category, function(cat) text_color(distinct_colors[cat])))
+
+
+DATA_product$Subcategory <- gsub("Stylosanthes guianensis", "Stylo", DATA_product$Subcategory)
+DATA_product$Subcategory <- gsub("Desmodium intortum", "Greenleaf Desmodium", DATA_product$Subcategory)
+DATA_product$Subcategory <- gsub("Medicago truncatula", "Barrel Medic", DATA_product$Subcategory)
+
+
+plot10 <- ggplot(DATA_product, aes(area = N_Studies, fill = Category, 
+                                   subgroup = Category_Label,  # Grouping by main Category
+                                   label = ifelse(N_Studies == 1, "", paste0(Subcategory, "\n", "(", N_Studies, ")")))) +
+  geom_treemap() +
+  geom_treemap_subgroup_border(color = "grey", size = 8) +  # Thicker border for each Category
+  geom_treemap_subgroup_text(aes(label = Category_Label, 
+                                 color = ifelse(Category == "Cash Crops", "orange", "yellow")),  
+                             place = "bottomleft", grow = FALSE, reflow = TRUE, 
+                             fontface = "bold", size = 10, min.size = 4) +  # Category names in orange for Cash Crops, yellow otherwise
+  geom_treemap_text(aes(label = ifelse(N_Studies == 1, "", paste0(Subcategory, "\n", "(", N_Studies, ")")), 
+                        color = text_color), 
+                    place = "center", grow = FALSE, reflow = TRUE, size = 13) +  # Product names and counts
+  scale_fill_manual(values = distinct_colors, guide = "none") +  # Apply colors
+  scale_color_identity() +
+  theme(
+    text = element_text(family = "Arial", size = 8),
+    panel.background = element_rect(fill = "white")
+  )
+
+# Display the plot
+plot10
+
+ggsave(filename = "product_treemap_final.png", plot = plot10, width = 15, height = 10, dpi = 300)
+```
+
+## Commonly Measured Outcomes in LTEs
+
+```{r,warning=FALSE}
+# Load and process the master sheet data
+era_master_sheet_out_ <- read_csv("era_master_sheet(out).csv")
+
+# Merge and process outcome data with hierarchical structure
+DATA_OUTCOMES <- filtered_Tables$Out.Out %>%
+  left_join(era_master_sheet_out_, by = c("Out.Subind" = "Subindicator")) %>%
+  dplyr::select(B.Code, Pillar, Subpillar, Indicator, Out.Subind) %>%
+  distinct() %>%
+  mutate(Indicator = case_when(
+    Indicator %in% c("Labour", "Gender Equity") ~ "Labour & Gender",
+    Indicator == "Efficiency" ~ "Resource Use Efficiency",
+    Indicator == "Pest & Pathogen" ~ "Post-Harvest Losses",
+    Indicator %in% c("Economic Performance", "Costs", "Income") ~ "Economics",
+    Indicator == "Non-Product Yield" ~ "By-Product Yield",
+    TRUE ~ Indicator
+  )) %>%
+  group_by(Pillar, Subpillar, Indicator, B.Code) %>%
+  summarize(N_Studies = n_distinct(B.Code), .groups = 'drop') %>%
+  group_by(Pillar, Subpillar, Indicator) %>%
+  summarize(N_Studies = sum(N_Studies), .groups = 'drop') %>%
+  mutate(Pillar = factor(Pillar, levels = c("Productivity", "Resilience", "Mitigation")))
+
+# Define custom colors and legend
+category_colors <- c(
+  "Biodiversity" = "#993300",
+  "Carbon Stocks" = "tan4",
+  "Emissions" ="tan3",
+  "Economics" = "wheat2",
+  "Labour & Gender" = "orangered3",
+  "Product Yield" = "wheat1",
+  "Resource Use Efficiency" = "coral2",
+  "By-Product Yield"="wheat3",
+  "Soil Quality" = "salmon2"
+)
+custom_legend_order <- c( "By-Product Yield","Economics", "Product Yield", "Biodiversity", 
+                         "Labour & Gender", "Resource Use Efficiency", 
+                         "Soil Quality", "Carbon Stocks","Emissions")
+custom_studies_order <- c(11,26,202,10,2,27,75,11,11)
+
+# Compute total LTEs for each pillar
+totals_heights <- DATA_OUTCOMES %>%
+  group_by(Pillar) %>%
+  summarize(total_N_Studies = sum(N_Studies), height_for_total = total_N_Studies + 10)
+
+# Create the plot
+plot3 <- ggplot(DATA_OUTCOMES, aes(x = Pillar, y = N_Studies, fill = Indicator)) +
+  geom_col(width = 0.9) +
+  geom_text(data = totals_heights, aes(x = Pillar, y = height_for_total, label = total_N_Studies), 
+            inherit.aes = FALSE, size = 5, vjust = -0.2) +
+  labs(x = NULL, y = "Number of Studies") +
+  scale_fill_manual(
+    values = category_colors,
+    breaks = custom_legend_order,
+    labels = paste(custom_legend_order, " (", custom_studies_order, ")", sep = "")
+  ) +
+  scale_y_continuous(limits = c(0, 270), expand = c(0, 0)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size = 12),
+    axis.ticks.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    legend.position = c(1, 1),
+    legend.justification = c(1, 1),
+    legend.box = "vertical"
+  ) +
+  labs(fill = "Outcome Indicator")
+
+# Display the plot
+print(plot3)
+
+```
+
+Some LTEs can measure more than one outcome during the experiment. We have a total of 181 Long term experiment data so here the numbers are adding to more experiment than wwe have data for. This is because for example an LTE can measure both By-Product yield and Product yield. In this case the experiment would be counted twice. We can unstack the bars to have a more intuitive figure.
+
+```{r,warning=FALSE}
+# Determine maximum y values and custom x positions for each Pillar
+max_values <- DATA_OUTCOMES %>%
+  group_by(Pillar) %>%
+  summarize(
+    max_y = max(N_Studies) + 25,  # Adjust spacing above the bar
+    x_position = case_when(
+      Pillar == "Productivity" ~ 2,
+      Pillar == "Resilience" ~ 3,
+      Pillar == "Mitigation" ~ 1
+    )
+  )
+
+# Create faceted plot with annotations
+plot3 <- ggplot(DATA_OUTCOMES, aes(x = Indicator, y = N_Studies, fill = Indicator)) +
+  geom_col(width = 0.9) +
+  labs(x = NULL, y = "Number of Studies") +
+  scale_fill_manual(
+    values = category_colors,
+    breaks = custom_legend_order,
+    labels = paste(custom_legend_order, " (", custom_studies_order, ")", sep = "")
+  ) +
+  scale_y_continuous(limits = c(0, 270), expand = c(0, 0)) +
+  facet_wrap(~Pillar, scales = "free_x") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    axis.line.y = element_blank(),
+    axis.text.y = element_text(size = 12),
+    axis.ticks.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none"
+  ) +
+  labs(fill = "Outcome Indicator") +
+  
+  # Add count labels on top of each bar
+  geom_text(
+    aes(label = N_Studies),
+    vjust = -0.5,
+    size = 3.5
+  ) +
+  
+  # Add pillar labels with custom x positions
+  geom_text(
+    data = max_values,
+    aes(x = x_position, y = max_y, label = Pillar),
+    inherit.aes = FALSE,
+    size = 4
+  )
+
+# Display the plot
+print(plot3)
+
+```
+
+A valuable analysis is examining which outcomes are commonly studied together in long-term experiments. An UpSet plot can effectively visualize these outcomes combinations, revealing patterns of co-studied outcomes across LTEs.
+
+```{r,warning=FALSE,fig.width=15, fig.height=10}
+
+
+
+# Step 2: Merge and process outcome data with hierarchical structure
+DATA_OUTCOMES <- filtered_Tables$Out.Out %>%
+  left_join(era_master_sheet_out_, by = c("Out.Subind" = "Subindicator")) %>%
+  dplyr::select( B.Code, Pillar, Subpillar, Indicator, Out.Subind) %>%
+  distinct() %>%
+  mutate(Indicator = case_when(
+    Indicator %in% c("Labour", "Gender Equity") ~ "Labour & Gender",
+    Indicator == "Efficiency" ~ "Resource Use Efficiency",
+    Indicator == "Pest & Pathogen" ~ "Post-Harvest Losses",
+    Indicator %in% c("Economic Performance", "Costs", "Income") ~ "Economics",
+    TRUE ~ Indicator
+  ))
+
+DATA_OUTCOMES<-DATA_OUTCOMES%>%
+  dplyr::select(B.Code,Pillar, Subpillar, Indicator)%>%
+  distinct()
+
+# Step 3: Create list of indicators for each LTE.ID
+indicator_list <- DATA_OUTCOMES %>%
+  group_by(B.Code) %>%
+  summarise(Indicators = list(unique(Indicator))) %>%
+  pull(Indicators)
+
+# Step 4: Prepare data for UpSet plot
+# Convert the list of indicators into a format compatible with UpSetR's fromList function
+indicator_list_named <- list()
+for (ind in unique(DATA_OUTCOMES$Indicator)) {
+  indicator_list_named[[ind]] <- DATA_OUTCOMES %>%
+    filter(Indicator == ind) %>%
+    distinct(B.Code) %>%
+    pull(B.Code)
+}
+
+# Step 5: Generate the UpSet plot
+upset_plot <- upset(
+  fromList(indicator_list_named),
+  order.by = c("degree", "freq"),        # Order intersections by degree and then by frequency
+  decreasing = c(TRUE, TRUE),            # Sort both degree and frequency in descending order
+  nsets = length(indicator_list_named),  # Display all indicators in set size bars
+  nintersects = NA,                      # Show all intersections and let the order be controlled by degree and freq
+  keep.order = FALSE,                    # Automatically order sets by size unless specified
+  sets = names(indicator_list_named),
+  mainbar.y.label = "Number of Studies by Outcomes",
+  sets.x.label = "Total Studies by Indicator",
+  point.size = 3.5,
+  line.size = 2,
+  text.scale = c(1.3, 1.3, 1, 1, 2, 3)
+)
+
+
+# Plot the UpSet graph
+print(upset_plot)
+
+# Optional: Add title to the plot
+grid.text(
+  "Distribution of Studies by Indicator",
+  x = 0.70,
+  y = 0.95,
+  gp = gpar(
+    fontsize = 12,
+    fontface = 3
+  )
+)
+
+
+```
+
+##Analyzing Practice Combinations in LTEs
+
+```{r,warning=FALSE,fig.width=15, fig.height=10}
+
+
+# Create a function to count LTEs for each practice and pull LTE IDs
+count_and_pull_lte <- function(data, column = "B.Code") {
+  lte_ids <- data %>%
+    distinct(!!sym(column)) %>%
+    pull(!!sym(column))
+  
+  lte_count <- length(lte_ids)
+  
+  list(count = lte_count, ids = lte_ids)
+}
+
+# Calculate LTE counts for each practice and pull corresponding LTE IDs
+rotation <- count_and_pull_lte(filtered_Tables$Rot.Out)
+intercropping <- count_and_pull_lte(filtered_Tables$Int.Out)
+irrigation <- count_and_pull_lte(filtered_Tables$Irrig.Method)
+mulch <- count_and_pull_lte(filtered_Tables$Res.Method)
+agroforestry <- count_and_pull_lte(filtered_Tables$AF.Out)
+
+tillage <- filtered_Tables$MT.Out %>%
+  filter(grepl("No or Zero Tillage", Till.Practice)) %>%
+  distinct(B.Code) %>%
+  pull(B.Code)
+
+tillage_count <- length(tillage)
+
+
+
+
+# Count LTEs with only "Improved" varieties
+improved_var_lte <- filtered_Tables$Var.Out %>%
+  filter(grepl("Improved", V.Crop.Practice)) %>%
+  distinct(B.Code) %>%
+  pull(B.Code)
+
+improved_only_count <- length(improved_var_lte)
+
+
+
+# Count LTEs with organic fertilizers (excluding specific categories)
+organic_lte <- filtered_Tables$Fert.Method %>%
+  filter(
+    !grepl("Inorganic", F.Category) &
+    !grepl("MicroNutrient", F.Category) &
+    !grepl("Unspecified", F.Category)
+  ) %>%
+  distinct(B.Code) %>%
+  pull(B.Code)
+
+organic_count <- length(organic_lte)
+
+# Identify LTEs comparing different levels of inorganic fertilizer
+inorganic_levels_LTEs <- filtered_Tables$Fert.Method %>%
+  filter(grepl("Inorganic", F.Category)) %>%
+  group_by(B.Code) %>%
+  summarise(level_count = n_distinct(F.Level.Name)) %>%
+  filter(level_count > 1) %>%
+  pull(B.Code)
+
+inorganic_levels_count <- length(inorganic_levels_LTEs)
+
+
+
+# Deduce the overlap from others
+inorganic_levels_count <- length(inorganic_levels_LTEs)
+
+# Summarize the LTE counts for each practice
+lte_summary <- tibble(
+  Practice = c(
+    "Rotation", "Intercropping", "Irrigation", "Tillage", "Mulch", "Agroforestry", "Improved Varieties","Organic Fertilizers", "Inorganic Fertilizers"
+  ),
+  LTE_Count = c(
+    rotation$count, intercropping$count, irrigation$count, tillage_count, mulch$count,
+    agroforestry$count, improved_only_count,
+    organic_count, inorganic_levels_count
+  )
+)
+
+# Step 2: Create a list of solo practices with corresponding LTE IDs
+solo_practice_list <- list(
+  Rotation = rotation$ids,
+  Intercropping = intercropping$ids,
+  Irrigation = irrigation$ids,
+  Tillage = tillage,
+  Mulch = mulch$ids,
+  Agroforestry = agroforestry$ids,
+  "Improved Varieties" = improved_var_lte,
+  "Organic Fertilizers" = organic_lte,
+  "Inorganic Fertilizers" = inorganic_levels_LTEs
+)
+
+# Step 3: Convert the practice list to a combination matrix and create the UpSet plot
+upset_plot <- upset(
+  fromList(solo_practice_list),
+  order.by = "freq",
+  nsets = length(solo_practice_list), # Use all solo practices as set size bars
+  nintersects = 11, # Show all intersections
+  keep.order = FALSE, # Maintain the order of sets as they appear in set_list
+  sets = names(solo_practice_list), # All solo practices have set size bars
+  mainbar.y.label = "Number of Studies",
+  sets.x.label = "Total Studies by Practice",
+  point.size = 3.5,
+  line.size = 2,
+  text.scale = c(1.3, 1.3, 1, 1, 2, 3)
+)
+
+# Plot the UpSet graph
+upset_plot
+
+# Optionally, add a title or further labels to the plot
+grid.text(
+  "Bundle of Practices",
+  x = 0.70,
+  y = 0.95,
+  gp = gpar(
+    fontsize = 12,
+    fontface = 3
+  )
+)
+
+#ggsave("upset.png", upset_plot, width = 15, height = 10, dpi = 500)
+
+```
+
+```{r}
+library(dplyr)
+library(UpSetR)
+library(grid)
+
+# Step 1: Categorize crop products by B.Code
+crop_categories <- site_data %>%
+  inner_join(filtered_Tables$Prod.Out, by = "B.Code") %>%
+  group_by(B.Code) %>%
+  summarize(
+    has_maize = any(grepl("Maize", P.Product, ignore.case = TRUE)),
+    has_legumes = any(grepl("Legumes", P.Product.Subtype, ignore.case = TRUE)),
+    has_coffee = any(grepl("Coffee", P.Product, ignore.case = TRUE))
+  ) %>%
+  mutate(Category_Group = case_when(
+    has_maize & !has_coffee & !has_legumes ~ "Maize",
+    has_maize & has_legumes & !has_coffee ~ "Maize and Legumes",
+    has_legumes & !has_maize & !has_coffee ~ "Legumes",
+    has_coffee & !has_maize & !has_legumes ~ "Coffee",
+    TRUE ~ "Other"
+  ))
+
+# Step 2: Merge practices with crop categories
+practice_data <- list(
+  Rotation = filtered_Tables$Rot.Out %>% distinct(B.Code),
+  Intercropping = filtered_Tables$Int.Out %>% distinct(B.Code),
+  Irrigation = filtered_Tables$Irrig.Method %>% distinct(B.Code),
+  Tillage = filtered_Tables$MT.Out %>%
+    filter(grepl("No or Zero Tillage", Till.Practice)) %>%
+    distinct(B.Code),
+  Mulch = filtered_Tables$Res.Method %>% distinct(B.Code),
+  Agroforestry = filtered_Tables$AF.Out %>% distinct(B.Code),
+  `Improved Varieties` = filtered_Tables$Var.Out %>%
+    filter(grepl("Improved", V.Crop.Practice)) %>%
+    distinct(B.Code),
+  `Organic Fertilizers` = filtered_Tables$Fert.Method %>%
+    filter(!grepl("Inorganic|MicroNutrient|Unspecified", F.Category)) %>%
+    distinct(B.Code),
+  `Inorganic Fertilizers` = filtered_Tables$Fert.Method %>%
+    filter(grepl("Inorganic", F.Category)) %>%
+    group_by(B.Code) %>%
+    summarise(level_count = n_distinct(F.Level.Name)) %>%
+    filter(level_count > 1) %>%
+    distinct(B.Code)
+)
+
+practice_data <- bind_rows(practice_data, .id = "Practice")
+
+# Step 3: Categorize practices by crop categories
+practice_categories <- practice_data %>%
+  inner_join(crop_categories, by = "B.Code")
+
+# Step 4: Generate UpSet plots for each crop category
+categories <- unique(practice_categories$Category_Group)
+upset_plots <- list()
+
+for (category in categories) {
+  # Filter data for the current crop category
+  category_practices <- practice_categories %>%
+    filter(Category_Group == category) %>%
+    group_by(Practice) %>%
+    summarize(LTEs = list(unique(B.Code)), .groups = "drop")
+  
+  # Convert to list format for UpSetR
+  practice_list <- setNames(
+    category_practices$LTEs,
+    category_practices$Practice
+  )
+  
+  # Generate UpSet plot
+  upset_plot <- upset(
+    fromList(practice_list),
+    order.by = "freq",
+    nsets = length(practice_list), # Use all practices as set size bars
+    nintersects = 11, # Show all intersections
+    mainbar.y.label = paste("Number of Studies -", category),
+    sets.x.label = "Total Studies by Practice",
+    point.size = 3.5,
+    line.size = 2,
+    text.scale = c(1.3, 1.3, 1, 1, 2, 3)
+  )
+  
+  # Add title to the plot
+  grid.text(
+    paste("Practices for Crop Category:", category),
+    x = 0.70,
+    y = 0.95,
+    gp = gpar(
+      fontsize = 12,
+      fontface = 3
+    )
+  )
+  
+  # Save the plot into the list
+  upset_plots[[category]] <- upset_plot
+}
+
+# Display all UpSet plots
+upset_plots
+
+```
+
+```{r}
+# Step 1: Join `site_data` with `DATA_product` on `B.Code`
+site_product_categories <- site_data %>%
+  inner_join(filtered_Tables$Prod.Out, by = "B.Code") %>%
+  group_by(B.Code) %>%
+  summarize(
+    has_maize = any(grepl("Maize", P.Product, ignore.case = TRUE)),
+    has_legumes = any(grepl("Legumes", P.Product.Subtype, ignore.case = TRUE)),
+    has_coffee = any(grepl("Coffee", P.Product, ignore.case = TRUE))
+  ) %>%
+  mutate(Category_Group = case_when(
+    has_maize & !has_coffee & !has_legumes ~ "Maize",
+    has_maize & has_legumes & !has_coffee ~ "Maize and Legumes",
+    has_legumes & !has_maize & !has_coffee ~ "Legumes",
+    has_coffee & !has_maize & !has_legumes ~ "Coffee",
+    TRUE ~ "Other"
+  ))
+
+
+# Step 2: Join the categorized data back to site_data
+final_data <- site_data %>%
+  left_join(site_product_categories, by = "B.Code")
+
+# Step 3: Ensure all relevant columns are included
+site_product_data <- final_data %>%
+  dplyr::select(B.Code, Country, Latitude, Longitude, Category_Group, everything())
+ 
+
+
+# Step 2: Prepare the World Map (Latin America Only)
+world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(continent %in% c("South America", "North America") & 
+           admin %in% latin_america_countries)
+
+# Step 3: Convert `site_product_data` to an `sf` object
+site_product_sf <- site_product_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+
+
+# Step 5: Plot the Map
+lte_counts <- site_product_data %>%
+  group_by(Country) %>%
+  summarise(N_Studies = n_distinct(B.Code)) %>%
+  ungroup()
+
+# Step 2: Prepare the World Map (Latin America Only)
+world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  filter(continent %in% c("South America", "North America") & 
+           admin %in% latin_america_countries) %>%
+  rename(Country = admin) %>%
+  left_join(lte_counts, by = "Country") %>%
+  mutate(N_Studies = replace_na(N_Studies, 0)) # Replace NA with 0 for countries with no studies
+
+# Step 3: Convert `site_product_data` to an `sf` object
+site_product_sf <- site_product_data %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+
+# Step 4: Define Colors for Categories
+category_colors <- c(
+  "Maize" = "#1f78b4",
+  "Maize and Legumes" = "#33a02c",
+  "Legumes" = "#e31a1c",
+  "Coffee" = "#ff7f00",
+  "Other" = "#6a3d9a"
+)
+
+plot_map <- ggplot() +
+  # Plot countries with fill based on number of studies
+  geom_sf(data = world %>% filter(N_Studies > 0), aes(fill = N_Studies), color = "white") +
+  # Plot countries with zero LTEs (N_Studies == 0) in grey
+  geom_sf(data = world %>% filter(N_Studies == 0), fill = "grey80", color = "white") +
+  # Plot points for LTEs with color based on crop categories
+  geom_point(data = site_product_sf, aes(x = Longitude, y = Latitude, color = Category_Group),
+             size = 1, alpha = 0.7) +
+  # Scale for number of studies
+  scale_fill_viridis_c(
+    option = "cividis",
+    direction = -1,
+    name = "Number of Studies",
+    na.value = "grey90"
+  ) +
+  # Scale for crop categories
+  scale_color_manual(values = category_colors, name = "Crops") +
+  # Styling and theming
+  theme_minimal() +
+  theme(
+    legend.key.size = unit(1, "lines"), 
+    legend.spacing = unit(0.5, "lines"),
+    legend.box = "horizontal", # Arrange legends horizontally
+    legend.box.spacing = unit(0.5, "cm"),
+    legend.position = c(0.1, 0.15), # Adjust position if needed
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  coord_sf(xlim = c(-120, -30), ylim = c(-60, 30), expand = FALSE) +
+  guides(
+    fill = guide_colorbar(order = 1),  # Order legends for studies first
+    color = guide_legend(order = 2)   # Then crop categories
+  )
+
+# Display the Map
+plot_map
+
+
+# Optional: Save the map as an image
+#ggsave(filename = "map_by_crop_category.png", plot = plot_map, width = 10, height = 8, dpi = 300)
+
+```
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(ggplot2)
+
+# Step 1: Categorize crops based on product data
+site_product_categories <- site_data %>%
+  inner_join(filtered_Tables$Prod.Out, by = "B.Code") %>%
+  group_by(B.Code) %>%
+  summarize(
+    has_maize = any(grepl("Maize", P.Product, ignore.case = TRUE)),
+    has_legumes = any(grepl("Legumes", P.Product.Subtype, ignore.case = TRUE)),
+    has_coffee = any(grepl("Coffee", P.Product, ignore.case = TRUE))
+  ) %>%
+  mutate(Category_Group = case_when(
+    has_maize & !has_coffee & !has_legumes ~ "Maize",
+    has_maize & has_legumes & !has_coffee ~ "Maize and Legumes",
+    has_legumes & !has_maize & !has_coffee ~ "Legumes",
+    has_coffee & !has_maize & !has_legumes ~ "Coffee",
+    TRUE ~ "Other"
+  ))
+
+# Step 2: Link product categories to outcomes
+outcomes_with_categories <- filtered_Tables$Out.Out %>%
+  inner_join(site_product_categories, by = "B.Code") %>%
+  left_join(era_master_sheet_out_, by = c("Out.Subind" = "Subindicator")) %>%
+  mutate(
+    Indicator = case_when(
+      Indicator %in% c("Labour", "Gender Equity") ~ "Labour & Gender",
+      Indicator == "Efficiency" ~ "Resource Use Efficiency",
+      Indicator == "Pest & Pathogen" ~ "Post-Harvest Losses",
+      Indicator %in% c("Economic Performance", "Costs", "Income") ~ "Economics",
+      TRUE ~ Indicator
+    )
+  ) %>%
+    filter(Indicator!="Non-Product Yield")%>%
+  distinct()
+
+# Step 3: Summarize outcomes by category
+outcomes_summary <- outcomes_with_categories %>%
+  group_by(Category_Group, Pillar, Subpillar, Indicator) %>%
+  summarize(N_Studies = n_distinct(B.Code), .groups = "drop") %>%
+  mutate(Pillar = factor(Pillar, levels = c("Productivity", "Resilience", "Mitigation")))
+
+# Define custom colors for indicators
+category_colors <- c(
+  "Biodiversity" = "#993300",
+  "Carbon Stocks" = "tan4",
+  "Emissions" = "tan3",
+  "Economics" = "wheat2",
+  "Labour & Gender" = "orangered3",
+  "Product Yield" = "wheat1",
+  "Resource Use Efficiency" = "coral2",
+  "Soil Quality" = "salmon2"
+)
+
+# Step 4: Create plots for each farming system category
+plots <- list()
+
+for (category in unique(outcomes_summary$Category_Group)) {
+  category_data <- outcomes_summary %>% filter(Category_Group == category)
+  
+
+  
+ plot <- ggplot(category_data, aes(x = Indicator, y = N_Studies, fill = Indicator)) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = category_colors) +
+  scale_y_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  facet_wrap(~Pillar, scales = "free_x") +
+  labs(
+    title = paste("Outcomes for Farming System:", category),
+    y = "Number of Studies",
+    fill = "Outcome Indicator"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    legend.position = "none",
+    panel.grid.major = element_blank(),  # Remove major grid lines
+    panel.grid.minor = element_blank(),  # Remove minor grid lines
+    panel.background = element_blank()   # Set panel background to blank
+  ) +
+  geom_text(aes(label = N_Studies), vjust = -0.5, size = 3)
+
+  plots[[category]] <- plot
+}
+
+# Display or save the plots
+for (category in names(plots)) {
+  print(plots[[category]])
+  ggsave(filename = paste0("outcomes_", category, ".png"), plot = plots[[category]], width = 10, height = 6)
+}
+
+```
+
+```{r}
+library(dplyr)
+library(UpSetR)
+library(grid)
+
+# Step 1: Categorize outcomes by crop categories
+category_data <- site_data %>%
+  inner_join(filtered_Tables$Prod.Out, by = "B.Code") %>%
+  group_by(B.Code) %>%
+  summarize(
+    has_maize = any(grepl("Maize", P.Product, ignore.case = TRUE)),
+    has_legumes = any(grepl("Legumes", P.Product.Subtype, ignore.case = TRUE)),
+    has_coffee = any(grepl("Coffee", P.Product, ignore.case = TRUE))
+  ) %>%
+  mutate(Category_Group = case_when(
+    has_maize & !has_coffee & !has_legumes ~ "Maize",
+    has_maize & has_legumes & !has_coffee ~ "Maize and Legumes",
+    has_legumes & !has_maize & !has_coffee ~ "Legumes",
+    has_coffee & !has_maize & !has_legumes ~ "Coffee",
+    TRUE ~ "Other"
+  ))
+
+# Step 2: Merge outcome data with crop categories
+DATA_OUTCOMES <- filtered_Tables$Out.Out %>%
+  left_join(era_master_sheet_out_, by = c("Out.Subind" = "Subindicator")) %>%
+  dplyr::select(B.Code, Pillar, Subpillar, Indicator, Out.Subind) %>%
+  distinct() %>%
+  mutate(Indicator = case_when(
+    Indicator %in% c("Labour", "Gender Equity") ~ "Labour & Gender",
+    Indicator == "Efficiency" ~ "Resource Use Efficiency",
+    Indicator == "Pest & Pathogen" ~ "Post-Harvest Losses",
+    Indicator %in% c("Economic Performance", "Costs", "Income") ~ "Economics",
+    TRUE ~ Indicator
+  ))
+
+DATA_OUTCOMES <- DATA_OUTCOMES %>%
+  dplyr::select(B.Code, Pillar, Subpillar, Indicator) %>%
+  distinct()
+
+category_outcome_data <- DATA_OUTCOMES %>%
+  left_join(category_data, by = "B.Code") %>%
+  filter(!is.na(Category_Group))
+
+# Step 3: Generate UpSet plots for each crop category
+categories <- unique(category_outcome_data$Category_Group)
+
+upset_plots <- list()
+
+for (category in categories) {
+  # Filter data for the current category
+  category_data <- category_outcome_data %>%
+    filter(Category_Group == category)
+  
+  # Create list of indicators for each B.Code
+  indicator_list_named <- list()
+  for (ind in unique(category_data$Indicator)) {
+    indicator_list_named[[ind]] <- category_data %>%
+      filter(Indicator == ind) %>%
+      distinct(B.Code) %>%
+      pull(B.Code)
+  }
+  
+  # Generate UpSet plot for the current category
+  upset_plot <- upset(
+    fromList(indicator_list_named),
+    order.by = c("degree", "freq"),        # Order intersections by degree and then by frequency
+    decreasing = c(TRUE, TRUE),            # Sort both degree and frequency in descending order
+    nsets = length(indicator_list_named),  # Display all indicators in set size bars
+    nintersects = NA,                      # Show all intersections
+    sets = names(indicator_list_named),
+    mainbar.y.label = paste("Number of Studies by Outcomes -", category),
+    sets.x.label = "Total Studies by Indicator",
+    point.size = 3.5,
+    line.size = 2,
+    text.scale = c(1.3, 1.3, 1, 1, 2, 3)
+  )
+  
+  # Save the plot into the list
+  upset_plots[[category]] <- upset_plot
+  
+  # Optional: Add title to the plot
+  grid.text(
+    paste("Distribution of Studies by Indicator -", category),
+    x = 0.70,
+    y = 0.95,
+    gp = gpar(
+      fontsize = 12,
+      fontface = 3
+    )
+  )
+}
+
+# Display all plots
+upset_plots
+
+```
+
+## Additional Information by Country and Practice
+
+```{r,warning=FALSE}
+# combined_summary <- site_data %>%
+#   dplyr::select(LTE.ID, Country) %>%
+#   distinct() %>%
+#   left_join(
+#     bind_rows(
+#       filtered_Tables$Rot.Out %>% mutate(Practice = "Rotation") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Int.Out %>% mutate(Practice = "Intercropping") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Irrig.Method %>% mutate(Practice = "Irrigation") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Till.Out %>% mutate(Practice = "Tillage") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Res.Method %>% mutate(Practice = "Mulch") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$AF.Out %>% mutate(Practice = "Agroforestry") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Var.Out %>% filter(grepl("Improved", V.Crop.Practice) & grepl("Unimproved", V.Crop.Practice)) %>% mutate(Practice = "Improved and Unimproved Varieties") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Var.Out %>% filter(grepl("Improved", V.Crop.Practice)) %>% mutate(Practice = "Improved Varieties") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Var.Out %>% filter(grepl("Unimproved", V.Crop.Practice)) %>% mutate(Practice = "Unimproved Varieties") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Fert.Method %>% filter(grepl("Inorganic", F.Category)) %>% mutate(Practice = "Inorganic Fertilizer") %>% dplyr::select(LTE.ID, Practice),
+#       filtered_Tables$Fert.Method %>% filter(!grepl("Inorganic|MicroNutrient|Unspecified", F.Category)) %>% mutate(Practice = "Organic Fertilizers") %>% dplyr::select(LTE.ID, Practice)
+#     ),
+#     by = "LTE.ID"
+#   )
+# 
+# summary_by_country_practice <- combined_summary %>%
+#   group_by(Country, Practice) %>%
+#   summarise(N_LTEs = n_distinct(LTE.ID)) %>%
+#   ungroup()
+# 
+# 
+# DT::datatable(
+#   summary_by_country_practice,
+#   options = list(
+#     scrollY = "400px",  # Set vertical scroll height
+#     pageLength = 20     # Initial number of rows displayed
+#   )
+# )
+# 
+# 
+
+```
